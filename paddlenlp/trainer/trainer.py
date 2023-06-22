@@ -677,9 +677,7 @@ class Trainer:
             step = 0
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
-            # timers("read-batch").start()
             for _, inputs in enumerate(epoch_iterator):
-                # timers("read-batch").stop()
                 self.callback_handler.on_load_data_end(args, self.state, self.control, inputs=inputs)
 
                 # Skip past any already trained steps if resuming training
@@ -810,7 +808,6 @@ class Trainer:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
                     step += 1
 
-                # timers("read-batch").start()
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
                 if (step + 1) % args.gradient_accumulation_steps == 0:
