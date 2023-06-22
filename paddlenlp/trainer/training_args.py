@@ -30,6 +30,7 @@ import paddle
 from paddle.distributed import fleet
 
 from ..utils.log import logger
+from .utils import timer
 from .trainer_utils import (
     IntervalStrategy,
     OptimizerNames,
@@ -802,7 +803,10 @@ class TrainingArguments:
 
                 # setter once https://github.com/PaddlePaddle/Paddle/blob/b7295120b0e78b293cd7ae29706e21769d06a3cc/python/paddle/distributed/fleet/base/distributed_strategy.py#L1692
                 strategy.hybrid_configs = hybrid_configs
+                timers = timer.get_timers()
+                timers("nccl-connection").start()
                 fleet.init(is_collective=True, strategy=strategy)
+                timers("nccl-connection").stop()
 
                 logger.info(strategy)
 
