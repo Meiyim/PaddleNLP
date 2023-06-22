@@ -58,6 +58,7 @@ from ..utils.env import (
 from ..utils.import_utils import is_datasets_available
 from ..utils.log import logger
 from .integrations import get_reporting_integration_callbacks
+from .utils import timer
 from .trainer_callback import (
     CallbackHandler,
     DefaultFlowCallback,
@@ -652,6 +653,21 @@ class Trainer:
 
             npu_accelerate_plugin(self.optimizer)
 
+
+        timers = timer.get_timers()
+        def timer_log(log_freq):
+            # Logging
+            timers_to_log = []
+
+            def add_to_logging(name):
+                if name in timers.timers:
+                    timers_to_log.append(name)
+
+            add_to_logging("read-batch")
+            add_to_logging("forward-backward")
+            add_to_logging("optimizer")
+            timers.log(timers_to_log, normalizer=log_freq)
+
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, paddle.io.DataLoader) and isinstance(
                 train_dataloader.batch_sampler, DistributedBatchSampler
@@ -661,7 +677,9 @@ class Trainer:
             step = 0
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
+            # timers("read-batch").start()
             for _, inputs in enumerate(epoch_iterator):
+                # timers("read-batch").stop()
                 self.callback_handler.on_load_data_end(args, self.state, self.control, inputs=inputs)
 
                 # Skip past any already trained steps if resuming training
@@ -758,6 +776,7 @@ class Trainer:
                     self.callback_handler.on_optimizer_begin(
                         args, self.state, self.control, scaler=self.scaler if self.do_grad_scaling else None
                     )
+                    timers("optimizer").start()
                     optimizer_was_run = True
                     if self.do_grad_scaling:
                         scale_before = self.scaler._scale.numpy()
@@ -776,6 +795,7 @@ class Trainer:
                         self.lr_scheduler.step()
 
                     self.optimizer.clear_grad()
+                    timers("optimizer").stop()
                     self.callback_handler.on_optimizer_end(
                         args, self.state, self.control, scaler=self.scaler if self.do_grad_scaling else None
                     )
@@ -790,8 +810,11 @@ class Trainer:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
                     step += 1
 
+                # timers("read-batch").start()
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    timer_log(args.logging_steps)
 
             if step < 0:
                 logger.warning(
@@ -1525,8 +1548,12 @@ class Trainer:
             return self.training_pipeline_step(model, inputs)
 
         model.train()
+        timers = timer.get_timers()
+        timers("read-batch").start()
         inputs = self._prepare_inputs(inputs)
+        timers("read-batch").stop()
 
+        timers("forward-backward").start()
         with self.autocast_smart_context_manager():
             loss = self.compute_loss(model, inputs)
 
@@ -1537,6 +1564,7 @@ class Trainer:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
+        timers("forward-backward").stop()
 
         return loss.detach()
 
@@ -1598,10 +1626,15 @@ class Trainer:
         model.micro_batch_size = self.args.per_device_train_batch_size
         model.accumulate_steps = self.args.gradient_accumulation_steps
 
+        timers = timer.get_timers()
+        timers("read-batch").start()
         inputs = _prepare_training(model, inputs)
+        timers("read-batch").stop()
 
         with self.autocast_smart_context_manager():
+            timers("forward-backward").start()
             loss = model.forward_backward_pipeline(inputs, self.scaler if self.do_grad_scaling else None)
+            timers("forward-backward").stop()
 
         model.micro_batch_size, model.accumulate_steps = config_backup
 
