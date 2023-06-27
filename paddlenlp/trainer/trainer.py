@@ -668,7 +668,7 @@ class Trainer:
             step = 0
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
-            for _, inputs in enumerate(epoch_iterator):
+            for step, inputs in enumerate(epoch_iterator):
                 self.callback_handler.on_load_data_end(args, self.state, self.control, inputs=inputs)
 
                 # Skip past any already trained steps if resuming training
@@ -683,7 +683,7 @@ class Trainer:
                             steps_trained_progress_bar.close()
                             steps_trained_progress_bar = None
                         self._load_rng_state(resume_from_checkpoint)
-                    step += steps_trained_in_current_epoch
+                    # step += steps_trained_in_current_epoch
                 elif steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
                     if steps_trained_progress_bar is not None:
