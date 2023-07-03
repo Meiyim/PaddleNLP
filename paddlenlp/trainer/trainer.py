@@ -2030,15 +2030,13 @@ class Trainer:
         state_dict = self._all_gather_state_dict(state_dict, opt_filter_func)
 
         def master_weights_filter_func(name):
-            assert (name in param2rank) or (name in opt_to_p), f"name {name} not in param2rank or opt_to_p"
-            if name in opt_to_p:
-                name = opt_to_p[name]
+            assert (name in param2rank), f"name {name} not in param2rank"
             return param2rank[name] == self.args.sharding_parallel_rank
         # master weights
         master_weights = self._all_gather_state_dict(master_weights, master_weights_filter_func)
         state_dict["master_weights"] = master_weights
 
-        #lr scheduler
+        # lr scheduler
         print(lr_scheduler)
         lr_schedulers = self._all_gather_simple_object(lr_scheduler)
         lr_scheduler = {}
