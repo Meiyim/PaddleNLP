@@ -471,7 +471,7 @@ class TrainingArguments:
     )
 
     load_sharded_model: bool = field(
-        default=True,
+        default=False,
         metadata={"help": ("whether load a sharded model when sharding_parallel_degree > 1")},
     )
 
