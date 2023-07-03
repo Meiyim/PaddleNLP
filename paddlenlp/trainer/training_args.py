@@ -975,6 +975,8 @@ class TrainingArguments:
                 name.append(f"tp{self.tensor_parallel_rank:0>2d}")
             if self.pipeline_parallel_degree > 1:
                 name.append(f"pp{self.pipeline_parallel_rank:0>2d}")
+            if self.sharding_parallel_degree > 1 and self.save_sharded_model:
+                name.append(f"shard{self.sharding_parallel_rank:0>2d}")
             return "_".join(name)
         else:
             return None
