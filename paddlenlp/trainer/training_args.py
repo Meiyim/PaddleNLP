@@ -470,7 +470,7 @@ class TrainingArguments:
         metadata={"help": ("whether saved sharded model when sharding_parallel_degree > 1")},
     )
 
-    load_sharded_model:: bool = field(
+    load_sharded_model: bool = field(
         default=True,
         metadata={"help": ("whether load a sharded model when sharding_parallel_degree > 1")},
     )

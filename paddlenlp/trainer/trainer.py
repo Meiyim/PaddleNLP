@@ -54,7 +54,12 @@ from tqdm.auto import tqdm
 
 from ..data import DataCollator, DataCollatorWithPadding, default_data_collator
 from ..peft import LoRAModel, PrefixModelForCausalLM
-from ..transformers.model_utils import PretrainedModel, _add_variant, unwrap_model
+from ..transformers.model_utils import (
+    PretrainedModel,
+    _add_variant,
+    unwrap_model,
+    unwrap_optimizer
+)
 from ..transformers.tokenizer_utils import PretrainedTokenizer
 from ..utils import device_guard
 from ..utils.batch_sampler import DistributedBatchSampler as NlpDistributedBatchSampler
@@ -419,7 +424,7 @@ class Trainer:
             return
 
         if self.args.load_sharded_model:
-            state_dict = self.load_multiple_state_dict_from_checkpoint(resume_from_checkpoint)
+            state_dict = self.load_state_dict_from_checkpoint_with_reshard(resume_from_checkpoint)
         else:
             state_dict = self.load_one_state_dict_from_checkpoint(resume_from_checkpoint, self.args.weight_name_suffix)
         # If the model is on the GPU, it still works!
@@ -456,24 +461,17 @@ class Trainer:
                 if not filter_func(recv_item[0]):
                     continue
                 gather_res[recv_item[0]] = paddle.to_tensor(recv_item[1], place=paddle.CPUPlace())
-            print(f"{i} gather {recv_item[0]} ")
+                print(f"{i} gather {recv_item[0]} ")
         return gather_res
 
 
-    def load_multiple_state_dict_from_checkpoint(self, resume_from_checkpoint):
-        """load state_dict of multiple shard from_checkpoint, Only load model state dict."""
-        meta_path = os.path.join(resume_from_checkpoint, MODEL_META_NAME)
-        assert os.path.exists(meta_path), f"meta_path"
-        with open(meta_path, 'r') as handle:
-            model_dist_meta = json.load(handle)
-        assert "parallel_config" in model_dist_meta
-        parallel_config = model_dist_meta["parallel_config"]
-        assert "pp_degree" in parallel_config
-        assert "mp_degree" in parallel_config
-        assert "sharding_dgree" in parallel_config
-        pp_degree =  parallel_config["pp_degree"]
+    def load_state_dict_from_checkpoint_with_reshard(self, resume_from_checkpoint):
+        """load state_dict from_checkpoint with reshard, Only load model state dict."""
+        parallel_config = self._load_distributed_strategy(resume_from_checkpoint)
+        pp_degree = parallel_config["pp_degree"]
+        pp_degree = parallel_config["pp_degree"]
         mp_degree = parallel_config["mp_degree"]
-        sharding_degree = parallel_config["sharding_dgree"]
+        sharding_degree = parallel_config["sharding_degree"]
         self.args.pipeline_parallel_degree == pp_degree
         self.args.tensor_parallel_degree == mp_degree
         cur_sharding_degree = self.args.sharding_parallel_degree
@@ -1865,11 +1863,23 @@ class Trainer:
         model_meta = {}
         model_meta["parallel_config"]={"pp_degree":pp_degree,
                                        "mp_degree":mp_degree,
-                                       "sharding_dgree":sharding_degree,
+                                       "sharding_degree":sharding_degree,
                                        "vpp_degree":vpp_degree}
         path=os.path.join(dir, MODEL_META_NAME)
         with open(path, 'w') as f:
             json.dump(model_meta, f, indent=4)
+
+    def _load_distributed_strategy(self, dir):
+        meta_path = os.path.join(dir, MODEL_META_NAME)
+        assert os.path.exists(meta_path), f"{meta_path} not exist"
+        with open(meta_path, 'r') as handle:
+            model_dist_meta = json.load(handle)
+        assert "parallel_config" in model_dist_meta
+        parallel_config = model_dist_meta["parallel_config"]
+        assert "pp_degree" in parallel_config
+        assert "mp_degree" in parallel_config
+        assert "sharding_degree" in parallel_config
+        return parallel_config
 
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None, merge_tensor_parallel=False):
@@ -1925,19 +1935,141 @@ class Trainer:
             # Good practice: save your training arguments together with the trained model
             paddle.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
 
+    def _all_gather_simple_object(self, obj, group=None):
+        if group is None:
+            group = self.hcg.get_sharding_parallel_group()
+        res = []
+        paddle.distributed.all_gather_object(res, obj)
+        return res
+
+    def _map_optimizer_state_to_param(self, optimizer_state_names):
+        optimizer = unwrap_optimizer(self.optimizer, DygraphShardingOptimizer)
+        all_names = list(optimizer._param2rank.keys())
+        all_names.extend(list(optimizer_state_names))
+        all_names.sort()
+        pre_p_name = ""
+        opt_to_p = {}
+        for n in all_names:
+            if n in optimizer._param2rank:
+                # we get a param
+                pre_p_name = n
+            else:
+                assert pre_p_name, n
+                opt_to_p[n] = pre_p_name
+        return opt_to_p
+
+    def _load_optimizer_state_of_one_shard(self, checkpoint, optimizer_name_suffix):
+        optimizer_name = _add_variant(OPTIMIZER_NAME, optimizer_name_suffix)
+        path = os.path.join(checkpoint, optimizer_name)
+        if os.path.isfile(path):
+            return paddlenlp_load(os.path.join(checkpoint, optimizer_name), return_numpy=True)
+        return None
+
+    def _load_optimizer_state_with_reshard(self, checkpoint):
+        """load state_dict of multiple shard from_checkpoint, Only load model state dict."""
+        parallel_config = self._load_distributed_strategy(checkpoint)
+        pp_degree = parallel_config["pp_degree"]
+        mp_degree = parallel_config["mp_degree"]
+        sharding_degree = parallel_config["sharding_degree"]
+        self.args.pipeline_parallel_degree == pp_degree
+        self.args.tensor_parallel_degree == mp_degree
+        cur_sharding_degree = self.args.sharding_parallel_degree
+
+        # no need reshard
+        if sharding_degree == cur_sharding_degree:
+            #return self._load_optimizer_state_of_one_shard(checkpoint, self.args.optimizer_name_suffix)
+            pass
+
+        state_dict = OrderedDict()
+        master_weights = OrderedDict()
+        lr_scheduler = {}
+
+        def get_name_suffix(i):
+            name = []
+            name.append(f"tp{self.args.tensor_parallel_rank:0>2d}")
+            name.append(f"pp{self.args.pipeline_parallel_rank:0>2d}")
+            name.append(f"shard{i:0>2d}")
+            return "_".join(name)
+
+        for i in range(self.args.sharding_parallel_rank, cur_sharding_degree, sharding_degree):
+            tmp = self._load_optimizer_state_of_one_shard(checkpoint, get_name_suffix(i))
+
+            if not tmp:
+                continue
+
+            for (k, v) in tmp.items():
+                if k == "master_weights":
+                    for (kk, vv) in v.items():
+                        master_weights[kk] = vv
+                    continue
+                if k == "LR_Scheduler":
+                    lr_scheduler[i] = v
+                    continue
+                state_dict[k] = v
+
+            del tmp
+
+            # gather all opt names
+        # list of list
+        opt_names_list = self._all_gather_simple_object(list(state_dict.keys()))
+        opt_names = []
+        for e in opt_names_list:
+            opt_names.extend(e)
+
+        # opt name to param name
+        opt_to_p = self._map_optimizer_state_to_param(opt_names)
+
+        optimizer = unwrap_optimizer(self.optimizer, DygraphShardingOptimizer)
+        param2rank = optimizer._param2rank
+
+        def opt_filter_func(name):
+            assert name in opt_to_p, f"name {name} not in opt_to_p"
+            param_name = opt_to_p[name]
+            assert param_name in param2rank, f"param_name {param_name} not in param2rank param2"
+            return param2rank[param_name] == self.args.sharding_parallel_rank
+        # state dict
+        state_dict = self._all_gather_state_dict(state_dict, opt_filter_func)
+
+        def master_weights_filter_func(name):
+            assert (name in param2rank) or (name in opt_to_p), f"name {name} not in param2rank or opt_to_p"
+            if name in opt_to_p:
+                name = opt_to_p[name]
+            return param2rank[name] == self.args.sharding_parallel_rank
+        # master weights
+        master_weights = self._all_gather_state_dict(state_dict, master_weights_filter_func)
+        state_dict["master_weights"] = master_weights
+
+        #lr scheduler
+        print(lr_scheduler)
+        lr_schedulers = self._all_gather_simple_object(lr_scheduler)
+        lr_scheduler = {}
+        for e in lr_schedulers:
+            for (k, v) in e.items():
+                lr_scheduler[k] = v
+        if lr_scheduler:
+            state_dict["LR_Scheduler"] = lr_scheduler[0]
+
+        return state_dict
+
+
+        def _load_optimizer_state(self, checkpoint):
+            if self.args.load_sharded_model:
+                return self._load_optimizer_state_with_reshard(checkpoint)
+            else:
+                return self._load_optimizer_state_of_one_shard(checkpoint, self.args.optimizer_name_suffix)
+
     def _load_optimizer_and_scheduler(self, checkpoint):
         """If optimizer and scheduler states exist, load them."""
         if checkpoint is None:
             return
 
-        optimizer_name = _add_variant(OPTIMIZER_NAME, self.args.optimizer_name_suffix)
+        opt_state_dict = self._load_optimizer_state(checkpoint)
 
-        if os.path.isfile(os.path.join(checkpoint, optimizer_name)) and os.path.isfile(
+        if opt_state_dict and os.path.isfile(
             os.path.join(checkpoint, SCHEDULER_NAME)
         ):
             # Load in optimizer and scheduler states
-            self.optimizer.set_state_dict(paddlenlp_load(os.path.join(checkpoint, optimizer_name), return_numpy=True))
-
+            self.optimizer.set_state_dict(opt_state_dict)
             self.lr_scheduler.set_state_dict(paddle.load(os.path.join(checkpoint, SCHEDULER_NAME)))
             if self.do_grad_scaling and os.path.isfile(os.path.join(checkpoint, SCALER_NAME)):
                 self.scaler.load_state_dict(paddle.load(os.path.join(checkpoint, SCALER_NAME), return_numpy=True))

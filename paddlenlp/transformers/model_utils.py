@@ -79,20 +79,22 @@ __all__ = [
     "register_base_model",
 ]
 
+def unwrap_optimizer(optimizer, optimizer_instances=()):
+    if optimizer is None:
+        return None
+    while hasattr(optimizer, "_inner_opt") and not isinstance(optimizer, optimizer_instances):
+        optimizer = optimizer._inner_opt
+    if isinstance(optimizer, optimizer_instances):
+        return optimizer
+    return None
+
 def filter_sharded_params(state_dict, optimizer, sharding_rank):
     from paddle.distributed.fleet.meta_optimizers.dygraph_optimizer.dygraph_sharding_optimizer \
         import DygraphShardingOptimizer
 
-    def _unwrap_optimizer(optimizer, optimizer_instances=()):
-        if optimizer is None:
-            return None
-        while hasattr(optimizer, "_inner_opt") and not isinstance(optimizer, optimizer_instances):
-            optimizer = optimizer._inner_opt
-        if isinstance(optimizer, optimizer_instances):
-            return optimizer
-        return None
+    logger.info(f"filter sharded_params not placed in sharding_rank {sharding_rank} .")
 
-    optimizer =_unwrap_optimizer(optimizer, DygraphShardingOptimizer)
+    optimizer = unwrap_optimizer(optimizer, DygraphShardingOptimizer)
     if optimizer is None:
         return state_dict
     filtered_state_dict = OrderedDict()
