@@ -1977,8 +1977,7 @@ class Trainer:
 
         # no need reshard
         if sharding_degree == cur_sharding_degree:
-            #return self._load_optimizer_state_of_one_shard(checkpoint, self.args.optimizer_name_suffix)
-            pass
+            return self._load_optimizer_state_of_one_shard(checkpoint, self.args.optimizer_name_suffix)
 
         state_dict = OrderedDict()
         master_weights = OrderedDict()
@@ -2036,7 +2035,7 @@ class Trainer:
                 name = opt_to_p[name]
             return param2rank[name] == self.args.sharding_parallel_rank
         # master weights
-        master_weights = self._all_gather_state_dict(state_dict, master_weights_filter_func)
+        master_weights = self._all_gather_state_dict(master_weights, master_weights_filter_func)
         state_dict["master_weights"] = master_weights
 
         #lr scheduler
