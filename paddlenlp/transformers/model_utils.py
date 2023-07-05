@@ -38,6 +38,7 @@ from huggingface_hub import (
 from huggingface_hub.utils import EntryNotFoundError
 from paddle import Tensor
 from paddle.nn import Embedding, Layer
+from paddle.distributed import fleet
 
 # TODO(fangzeyang) Temporary fix and replace by paddle framework downloader later
 from paddle.utils.download import is_url
@@ -78,6 +79,32 @@ __all__ = [
     "register_base_model",
 ]
 
+def unwrap_optimizer(optimizer, optimizer_instances=()):
+    if optimizer is None:
+        return None
+    while hasattr(optimizer, "_inner_opt") and not isinstance(optimizer, optimizer_instances):
+        optimizer = optimizer._inner_opt
+    if isinstance(optimizer, optimizer_instances):
+        return optimizer
+    return None
+
+def filter_sharded_params(state_dict, optimizer, sharding_rank):
+    from paddle.distributed.fleet.meta_optimizers.dygraph_optimizer.dygraph_sharding_optimizer \
+        import DygraphShardingOptimizer
+
+    logger.info(f"filter sharded_params not placed in sharding_rank {sharding_rank} .")
+
+    optimizer = unwrap_optimizer(optimizer, DygraphShardingOptimizer)
+    if optimizer is None:
+        return state_dict
+    filtered_state_dict = OrderedDict()
+    for (k, v) in state_dict.items():
+        assert v.name in optimizer._param2rank
+        sharded_rank = optimizer._param2rank[v.name]
+        if sharded_rank != sharding_rank:
+            continue
+        filtered_state_dict[k] = v
+    return filtered_state_dict
 
 def prune_linear_layer(layer: nn.Linear, index: paddle.Tensor, dim: int = 0) -> nn.Linear:
     """
@@ -1415,6 +1442,10 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
         variant = kwargs.get("variant", None)
         is_main_process = kwargs.get("is_main_process", True)
 
+        optimizer = kwargs.get("optimizer", None)
+        save_sharded_model = kwargs.get("save_sharded_model", False)
+        sharding_degree = kwargs.get("sharding_degree", 1)
+
         # 1. retrieve the model related config
 
         # save the string version of dtype to the config, e.g. convert paddle.float32 => "float32"
@@ -1426,10 +1457,14 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
         dtype = get_parameter_dtype(model_to_save)
         model_to_save.config.dtype = str(dtype).split(".")[1]
 
-        state_dict_to_save = None
         config_to_save = copy.deepcopy(model_to_save.config)
+        state_dict_to_save = model_to_save.state_dict()
+        if sharding_degree > 1 and save_sharded_model:
+            sharding_rank = fleet.get_hybrid_communicate_group().get_sharding_parallel_rank()
+            state_dict_to_save = filter_sharded_params(state_dict_to_save, optimizer, sharding_rank)
+
         if merge_tensor_parallel and config_to_save.tensor_parallel_degree > 1:
-            state_dict_to_save = model_to_save.merge_tensor_parallel(model_to_save.state_dict(), config_to_save)
+            state_dict_to_save = model_to_save.merge_tensor_parallel(state_dict_to_save, config_to_save)
             config_to_save.tensor_parallel_degree = 1
             # set variant to None for merge_tensor_parallel, but there should no relationship with variant setting
             variant = None
@@ -1442,12 +1477,11 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
                     variant = f"tp{config_to_save.tensor_parallel_rank:0>2d}"
                 # WEIGHTS_NAME = _add_variant(WEIGHTS_NAME, variant)
 
-            state_dict_to_save = self.state_dict()
-
         if is_main_process:
             # Attach architecture to the config
             config_to_save.architectures = [model_to_save.__class__.__name__]
             config_to_save.save_pretrained(save_dir)
+
 
         # Save model
         if paddle.in_dynamic_mode():
