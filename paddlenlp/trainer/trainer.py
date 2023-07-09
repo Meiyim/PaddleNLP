@@ -328,9 +328,14 @@ class Trainer:
             if self.args.fp16_opt_level == "O2":
                 if self.amp_dtype == "bfloat16":
                     # fix for paddlepaddle < 2.4.1, not support for bf16
-                    paddle.amp.decorate(models=model, level=self.args.fp16_opt_level, dtype=self.amp_dtype)
+                    paddle.amp.decorate(models=model, level=self.args.fp16_opt_level, dtype=self.amp_dtype, excluded_layers=[paddle.nn.LayerNorm])
                 else:
-                    paddle.amp.decorate(models=model, level=self.args.fp16_opt_level)
+                    paddle.amp.decorate(models=model, level=self.args.fp16_opt_level, excluded_layers=[paddle.nn.LayerNorm])
+                for p in model.parameters():
+                    if "norm" in p.name and p.dtype != paddle.float32:
+                        p_fp32 = p.cast(paddle.float32)
+                        p_fp32._share_buffer_to(p)
+                        p_fp32._clear()
             # for pipeline mode and pure tensor parallel
             if self.args.pipeline_parallel_degree > 1 or (
                 self.args.tensor_parallel_degree > 1 and self.sharding is None
@@ -1002,7 +1007,9 @@ class Trainer:
 
     def _set_state_dict_in_model(self, state_dict):
         # TODO  @ZHUI paddle need return the results of set_state_dict.
-        logger.info(f"set state-dict :{self.model.set_state_dict(state_dict)}")
+        missing_keys, unexpected_keys = self.model.set_state_dict(state_dict)
+        assert len(missing_keys) == 0 and len(unexpected_keys) == 0
+        logger.info(f"set state-dict :{(missing_keys, unexpected_keys)}")
 
     def _maybe_log_save_evaluate(self, tr_loss, model, epoch, ignore_keys_for_eval, **kwargs):
         if self.control.should_log:
