@@ -1900,7 +1900,7 @@ class Trainer:
         sharding_degree = 1
         vpp_degree = 1
         nranks = dist.get_world_size()
-        if nranks > 1:
+        if self.args.use_hybrid_parallel and nranks > 1:
             if dist.get_rank():
                 return
             hcg = fleet.get_hybrid_communicate_group()
@@ -1935,7 +1935,7 @@ class Trainer:
 
     def _save_sharding_meta(self, dir):
         nranks = dist.get_world_size()
-        if nranks <= 1:
+        if not self.args.use_hybrid_parallel or nranks <= 1:
             return
 
         hcg = fleet.get_hybrid_communicate_group()
@@ -1978,6 +1978,11 @@ class Trainer:
 
         merge_tensor_parallel = merge_tensor_parallel and self.args.use_hybrid_parallel
 
+        sharding_group = None
+        sharding_rank = 0
+        if paddle.distributed.get_world_size() > 1 and self.args.use_hybrid_parallel:
+            sharding_group = self.sharding_group
+            sharding_rank = sharding_group.rank
         if (
             not isinstance(self.model, PretrainedModel)
             and not isinstance(self.model, LoRAModel)
@@ -1991,7 +1996,7 @@ class Trainer:
                     is_main_process=self.args.should_save,
                     is_bf16=is_bf16,
                     param_names_in_master_weights=param_names_in_master_weights,
-                    sharding_group=self.sharding_group,
+                    sharding_group=sharding_group,
                     save_sharding_stage1_model=self.args.save_sharding_stage1_model,
                     optimizer=self.optimizer,
                 )
@@ -2002,11 +2007,10 @@ class Trainer:
                 if state_dict is None:
                     state_dict = self.model.state_dict()
                 if self.args.save_sharding_stage1_model:
-                    sharding_rank = self.sharding_group.rank
                     state_dict = filter_sharded_params(state_dict, self.optimizer, sharding_rank)
                     if is_bf16:
                         logger.info("before exclude state_dict_to_save len:{}".format(len(state_dict)))
-                        state_dict = exlclude_paramters_in_state_dict(state_dict, param_names_in_master_weights, self.sharding_group)
+                        state_dict = exlclude_paramters_in_state_dict(state_dict, param_names_in_master_weights, sharding_group)
                         logger.info("after exclude state_dict len:{}".format(len(state_dict)))
                 paddle.save(
                     state_dict,
@@ -2020,7 +2024,7 @@ class Trainer:
                 is_main_process=self.args.should_save,
                 is_bf16=is_bf16,
                 param_names_in_master_weights=param_names_in_master_weights,
-                sharding_group=self.sharding_group,
+                sharding_group=sharding_group,
                 save_sharding_stage1_model=self.args.save_sharding_stage1_model,
                 optimizer=self.optimizer,
                 sharding_degree=self.args.sharding_parallel_degree,
