@@ -613,6 +613,10 @@ class TrainingArguments:
         default=False,
         metadata={"help": "开启moe训练"},
     )
+    is_moe_infer: Optional[bool] = field(
+        default=False,
+        metadata={"help": "开启moe推理"},
+    )
 
     def __post_init__(self):
         env_local_rank = int(os.environ.get("PADDLE_RANK_IN_NODE", -1))
