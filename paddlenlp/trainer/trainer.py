@@ -143,6 +143,7 @@ from .training_args import TrainingArguments
 from .utils import reshard as reshard_util
 from .utils.helper import (  # nested_truncate,
     broadcast_dp_optimizer,
+    broadcast_moe_optimizer,
     distributed_concat,
     distributed_file,
     distributed_isfile,
@@ -942,10 +943,14 @@ class Trainer:
                 availiable_no_sync = dp_enabled and not forbidden_no_sync
 
                 is_no_sync = (
-                    ((step_control + 1) % args.gradient_accumulation_steps != 0)
-                    and availiable_no_sync
-                    and args._no_sync_in_gradient_accumulation
-                ) or (args.recompute and availiable_no_sync)
+                    (
+                        ((step_control + 1) % args.gradient_accumulation_steps != 0)
+                        and availiable_no_sync
+                        and args._no_sync_in_gradient_accumulation
+                    )
+                    or (args.recompute and availiable_no_sync)
+                    or (args.use_moe and availiable_no_sync)
+                )
                 # sharding
                 # stage1. the same as ddp
                 # stage2. manualy collect gradient on dp group
@@ -965,6 +970,14 @@ class Trainer:
 
                 tr_loss += tr_loss_step
 
+                def fused_allreduce_gradients_no_sync(paramlist, hcg):
+                    paramlist = list(paramlist)
+                    nonmoe_list = [p for p in paramlist if not getattr(p, "no_sync", False)]
+                    moelist = [p for p in paramlist if getattr(p, "no_sync", False)]
+                    if moelist and not self.args.use_moe:
+                        logger.warning("found `no sync` param when `use_moe=False`")
+                    fused_allreduce_gradients(nonmoe_list, hcg)
+
                 if (step_control + 1) % args.gradient_accumulation_steps == 0 or (
                     # last step in epoch but step is always smaller than gradient_accumulation_steps
                     steps_in_epoch <= args.gradient_accumulation_steps
@@ -983,12 +996,12 @@ class Trainer:
 
                     # Case 1: Use recompute and dp / sharding stage1,
                     # manualy collect gradient for dp.
-                    if args.recompute and availiable_no_sync:
-                        fused_allreduce_gradients(list(model.parameters()), None)
+                    if (args.recompute or args.use_moe) and availiable_no_sync:
+                        fused_allreduce_gradients_no_sync(list(model.parameters()), None)
 
                     # Case 2: hack dp with master_grad
-                    if dp_master_grad and not (args.recompute and availiable_no_sync):
-                        fused_allreduce_gradients(list(model.parameters()), None)
+                    elif dp_master_grad:
+                        fused_allreduce_gradients_no_sync(list(model.parameters()), None)
 
                     # Pipeline parallel mode,  handle gradient reduce here to overlap
                     pipeline_parallel_config = (
@@ -1007,8 +1020,7 @@ class Trainer:
                                 self.optimizer._inner_opt.reduce_gradients(list(parameters_list), self.optimizer._hcg)
 
                             if self.optimizer._dp_enable or getattr(self.optimizer, "_sep_enable", False):
-                                fused_allreduce_gradients(list(parameters_list), self.optimizer._hcg)
-
+                                fused_allreduce_gradients_no_sync(list(parameters_list), self.optimizer._hcg)
                     self.timers and self.timers("all-reduce").stop()
                     self.timers and self.timers("optimizer-step").start()
 
@@ -1028,7 +1040,9 @@ class Trainer:
                     )
                     optimizer_was_run = True
                     if self.do_grad_scaling:
-                        scale_before = paddle.assign(self.scaler._scale)
+                        if args.pipeline_parallel_degree > 1:
+                            assert not self.args.use_moe, "pipline moe not work under fp16"
+                        scale_before = self.scaler._scale.numpy()
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                         scale_after = self.scaler._scale
@@ -2042,7 +2056,7 @@ class Trainer:
 
         model.train()
         inputs = self._prepare_inputs(inputs)
-
+        self.timers and self.timers(f"forward-acc-{self._cur_acc_step}").start()
         with self.autocast_smart_context_manager():
             loss = self.compute_loss(model, inputs)
 
@@ -2053,7 +2067,7 @@ class Trainer:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
-
+        self.timers and self.timers(f"backward-acc-{self._cur_acc_step}").stop()
         return loss.detach()
 
     def training_pipeline_step(self, model: nn.Layer, inputs: Dict[str, Union[paddle.Tensor, Any]]) -> paddle.Tensor:
@@ -2142,6 +2156,20 @@ class Trainer:
             if self.args.should_save_model_state and self.args.should_save:
                 # For ckpt integrity
                 paddle.save(self.state.global_step, os.path.join(output_dir, ".model_done"))
+
+    def _save_moe_weights(
+        self,
+        output_dir: Optional[str] = None,
+        merge_tensor_parallel: Optional[bool] = False,
+    ):
+        # save moe optimizer and model state # TODO 默认为冗余存储
+
+        self._save(output_dir=output_dir, merge_tensor_parallel=merge_tensor_parallel)
+        optimizer_name = _add_variant(OPTIMIZER_NAME, self.args.optimizer_name_suffix)
+        saved_signal_path = os.path.join(output_dir, f"saved_signal_{dist.get_rank()}")
+        paddle.save(self.optimizer.state_dict(), os.path.join(output_dir, optimizer_name))
+        with open(saved_signal_path, mode="w+") as f:
+            f.write("1")
 
     def _save_checkpoint(self, model, metrics=None):
         # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
@@ -2245,6 +2273,8 @@ class Trainer:
             os.makedirs(output_dir, exist_ok=True)
             paddle.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
 
+        if self.args.use_moe and self.args.data_parallel_rank > 0:
+            self._save_moe_weights(output_dir)
         # Maybe delete some older checkpoints.
         # For hybrid parallel training, the checkpoint files maybe on different node.
         need_to_rotate_checkpoints = False
@@ -2476,7 +2506,10 @@ class Trainer:
         # broadcast optimizer state in dp group
         if self.args.local_rank != -1:
             dist.barrier()
-        opt_state_dict = broadcast_dp_optimizer(opt_state_dict)
+        if not self.args.use_moe:
+            opt_state_dict = broadcast_dp_optimizer(opt_state_dict)
+        else:
+            opt_state_dict = broadcast_moe_optimizer(opt_state_dict)
 
         if opt_state_dict is not None:
             # Load in optimizer and scheduler states
