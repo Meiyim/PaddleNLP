@@ -17,19 +17,18 @@
 #  https://github.com/huggingface/transformers/blob/main/src/transformers
 
 import os
+from dataclasses import dataclass
+from functools import reduce
+from itertools import groupby
 from typing import Any, Optional
 
 import numpy as np
 import paddle
 import paddle.distributed as dist
 from paddle.distributed import fleet
+from paddle.utils.layers_utils import flatten, map_structure, pack_sequence_as
 
 from paddlenlp.utils.log import logger
-from paddlenlp.utils.nested import (
-    nested_broadcast_tensor,
-    nested_empty_tensor,
-    nested_reduce_tensor,
-)
 
 __all__ = [
     "distributed_concat",
@@ -183,6 +182,95 @@ def distributed_file(filename):
         return filename
 
 
+@dataclass
+class _DtypeSndShape:
+    dtype: paddle.dtype
+    shape: list
+    value: Optional[Any] = None
+
+    def size(self):
+        return reduce(lambda x, y: x * y, self.shape)
+
+
+def split_group(grouped, split_size):
+    ret = []
+    while grouped:
+        if sum([r[1].size() for r in ret]) > split_size:
+            yield ret
+            ret = []
+        ret.append(grouped.pop())
+    if ret:
+        yield ret
+
+
+def broadcast_any_struct(data, src_rank, this_rank, group):
+    """广播任意嵌套嵌套的 `data` 结构
+    Args:
+        data : 任意嵌套嵌套的 `data` 结构
+        src_rank (int): 发送节点的全局 rank
+        this_rank (int): 本机 mp_rank
+        group (ProcessGroup): 通信组
+
+    Returns:
+        data: 广播后的 `data`
+    """
+    if this_rank == src_rank:
+        template = [
+            map_structure(
+                lambda x: _DtypeSndShape(dtype=x.dtype, shape=x.shape)
+                if isinstance(x, paddle.Tensor)
+                else _DtypeSndShape(dtype="", shape=[0], value=x),
+                data,
+            )
+        ]
+    else:
+        template = [None]
+    dist.broadcast_object_list(template, src_rank, group)
+    template = template[0]
+    # log.info(f'[rank={dist.get_rank()}]: {template}')
+
+    temp_flat = flatten(template)
+    data_flat = flatten(data)
+    # log.info(f'[rank={dist.get_rank()}] {temp_flat[0]}')
+    keyfn = lambda i: str(i[1].dtype)
+    ret_flat = [-1 for _ in range(len(temp_flat))]
+    for dtype, grouped in groupby(sorted(enumerate(temp_flat), key=keyfn), keyfn):
+        grouped = list(grouped)
+        for grouped_chunk in split_group(grouped, 2**30):  # 对 > 2**31 的 tensor 进行 spilt 会出 paddle 问题。
+            idxs = [g[0] for g in grouped_chunk]
+            if not dtype:
+                for id, info in grouped_chunk:
+                    ret_flat[id] = info.value  # 对非 tensor 叶子节点，shape 存放对象本身
+                continue
+
+            data_buf_shapes = [reduce(lambda x, y: x * y, g[1].shape) for g in grouped_chunk]
+            if this_rank == src_rank:
+                data_buf = paddle.concat([data_flat[i].reshape([-1]) for i in idxs], 0)
+            else:
+                data_buf = paddle.empty([sum(data_buf_shapes)], dtype=grouped_chunk[0][1].dtype)
+            logger.info(
+                f"[rank={dist.get_rank()}]<={src_rank}: broadcast data:{data_buf.shape} dtype={data_buf.dtype}"
+            )
+            dist.broadcast(
+                data_buf,
+                src_rank,
+                group,
+            )
+            logger.info(
+                f"[rank={dist.get_rank()}]<={src_rank}: done broadcast data:{data_buf.shape} dtype={data_buf.dtype}"
+            )
+
+            if this_rank != src_rank:
+                # log.info(f'[rank={dist.get_rank()}] split:{data_buf_shapes}')
+                for g, data_chunk in zip(grouped_chunk, data_buf.split(data_buf_shapes, axis=0)):
+                    ret_flat[g[0]] = data_chunk.reshape(g[1].shape)
+
+    if this_rank != src_rank:
+        assert not [r for r in ret_flat if r is -1], ret_flat
+        data = pack_sequence_as(template, ret_flat)
+    return data
+
+
 def broadcast_dp_optimizer(state_dict):
     if paddle.distributed.get_world_size() <= 1:
         return state_dict
@@ -201,29 +289,7 @@ def broadcast_dp_optimizer(state_dict):
         src_rank = 0
         process_rank = paddle.distributed.get_rank()
 
-    if process_rank == src_rank:
-        if state_dict is None:
-            logger.warning(
-                f"Your local rank {paddle.distributed.get_rank()} must have a state_dict. dp_rank:{process_rank}, src_rank:{src_rank}"
-            )
-        fake_state_dict = [nested_reduce_tensor(state_dict)]
-    else:
-        if state_dict is not None:
-            logger.warning(
-                f"Your local rank {paddle.distributed.get_rank()}  are forbidden to have a state_dict. dp_rank:{process_rank}, src_rank:{src_rank}"
-            )
-        fake_state_dict = [None]
-
-    paddle.distributed.broadcast_object_list(
-        fake_state_dict,
-        src=src_rank,
-        group=dp_group,
-    )
-    fake_state_dict = fake_state_dict[0]
-    if process_rank != src_rank:
-        state_dict = nested_empty_tensor(fake_state_dict)
-
-    state_dict = nested_broadcast_tensor(state_dict, src=src_rank, group=dp_group)
+    state_dict = broadcast_any_struct(state_dict, src_rank, process_rank, dp_group)
 
     return state_dict
 
