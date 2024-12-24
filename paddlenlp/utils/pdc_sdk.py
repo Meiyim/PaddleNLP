@@ -362,7 +362,9 @@ class PDCTools:
         error_code = PDCErrorCode.Success
         try:
             result = subprocess.run(cmd_args, capture_output=True, text=True)
-            if result.returncode != 0:
+            if result.returncode == 0:
+                logger.info(f"exec cmd {cmd_args} successfully, result: {result.stdout}; {result.stderr}")
+            else:
                 logger.error(f"exec cmd {cmd_args} failed, exit code: {result.returncode}, err: {result.stderr}")
                 # TODO(@zezhao): add more error code
                 error_code = PDCErrorCode.CommandFail

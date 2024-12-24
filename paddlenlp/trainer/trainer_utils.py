@@ -34,6 +34,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 import paddle
+import paddle.distributed as dist
 from paddle.distributed import fleet
 from paddle.distributed.fleet.meta_parallel import get_rng_state_tracker
 from paddle.io import IterableDataset
@@ -1091,7 +1092,15 @@ def download_recovery_ckpt_from_pdc(recovery_checkpoint_path, timeout):
     except Exception as e:
         raise RuntimeError(f"{PDC_DOWNLOAD_ERROR}; Failed to parse checkpoint path, details: {e}")
     start_time = time.time()
+    # TODO(@gexiao): temporary workaround for environment variable conflicts.
+    original_trainer_id = os.getenv("PADDLE_TRAINER_ID")
+    original_trainers_num = os.getenv("PADDLE_TRAINERS_NUM")
+    cards_per_node = int(os.getenv("PADDLE_LOCAL_SIZE", "8"))
+    os.environ["PADDLE_TRAINER_ID"] = str(dist.get_rank() // cards_per_node)
+    os.environ["PADDLE_TRAINERS_NUM"] = str(dist.get_world_size() // cards_per_node)
     result = pdc_tool.pdc_download_checkpoint(download_step, timeout)
+    os.environ["PADDLE_TRAINER_ID"] = original_trainer_id
+    os.environ["PADDLE_TRAINERS_NUM"] = original_trainers_num
     end_time = time.time()
     if result == PDCErrorCode.Success:
         logger.info(f"Successfully downloaded checkpoint from PDC, total time cost: {end_time - start_time} seconds.")
