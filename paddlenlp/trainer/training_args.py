@@ -876,6 +876,10 @@ class TrainingArguments:
             "help": "Set pipeline hook capacity usage ratio. Lower value brings faster save speed but may effect calculation speed."
         },
     )
+    flash_save_ema_coef: Optional[float] = field(
+        default=0,
+        metadata={"help": "The coefficient of EMA parameters in flash save mode. if set to 0, skip EMA process"},
+    )
     save_tokenizer: Optional[bool] = field(
         default=True,
         metadata={"help": "Save tokenizer to output_dir."},

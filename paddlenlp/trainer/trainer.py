@@ -162,7 +162,7 @@ from .utils.async_save import AsyncSaver
 
 try:
     from .utils.flash_checkpoint import FlashCheckpointManager, get_fused_param_mappings
-except:
+except (ImportError, ModuleNotFoundError):
     FlashCheckpointManager, get_fused_param_mappings = None, None
 from .utils.helper import (  # nested_truncate,
     broadcast_dp_optimizer,
@@ -692,10 +692,11 @@ class Trainer:
             self._load_from_checkpoint(resume_from_checkpoint)
         return model
 
-    def create_flash_checkpoint_manager(self, unwrapped_model):
+    def create_flash_checkpoint_manager(self, unwrapped_model, resume_from_checkpoint=None):
         """
         Create flash checkpoint manager.
         Has to be called after pipeline model is created.
+        resume_from_checkpoint: if use Flash checkpoing EMA, load previous checkpoint status
         """
         assert isinstance(self.model, PretrainedModel), "model should be a PretrainedModel when using flash"
         logger.info("Create flash checkpoint manager...")
@@ -707,6 +708,7 @@ class Trainer:
             worker_num=self.args.flash_workers_num,
             pipeline_hooks_capacity=pipeline_hooks_capacity,
             capacity_usage=self.args.flash_pipeline_hooks_capacity_usage,
+            ema_coef=self.args.flash_save_ema_coef,
         )
         for i in range(unwrapped_model.forward_pipeline_parallel_hook_capacity):
             unwrapped_model.register_forward_pipeline_parallel_hook(
@@ -716,6 +718,11 @@ class Trainer:
             unwrapped_model.register_backward_pipeline_parallel_hook(
                 location=i, hook=self.flash_checkpoint_manager.flash_checkpoint_pipeline_hook
             )
+        if resume_from_checkpoint is not None:
+            path = _add_variant(PADDLE_OPTIMIZER_NAME, self.args.optimizer_name_suffix)
+            path = os.path.join(resume_from_checkpoint, path).replace("optimizer", "ema")
+            logger.info(f"FC EMA load from {path}")
+            self.flash_checkpoint_manager.set_ema_state_dict(path)
         logger.info("Create flash checkpoint manager done.")
 
     def maybe_update_flash_checkpoint_worker(self):
@@ -900,7 +907,7 @@ class Trainer:
             self._load_optimizer_and_scheduler(resume_from_checkpoint)
 
         if self.args.enable_flash_save_mode:
-            self.create_flash_checkpoint_manager(model)
+            self.create_flash_checkpoint_manager(model, resume_from_checkpoint)
 
         logger.info(f"{self.runtime_timer.log()}")
 
