@@ -42,6 +42,7 @@ import paddle.distributed as dist
 import paddle.nn as nn
 from packaging import version
 from paddle import framework
+from paddle.distributed.fleet.meta_parallel import PipelineLayer
 
 try:
     from paddle.base import core
@@ -161,7 +162,11 @@ from .utils import reshard as reshard_util
 from .utils.async_save import AsyncSaver
 
 try:
-    from .utils.flash_checkpoint import FlashCheckpointManager, get_fused_param_mappings
+    from .utils.flash_checkpoint import (
+        FlashCheckpointCallback,
+        FlashCheckpointManager,
+        get_fused_param_mappings,
+    )
 except (ImportError, ModuleNotFoundError):
     FlashCheckpointManager, get_fused_param_mappings = None, None
 from .utils.helper import (  # nested_truncate,
@@ -350,8 +355,6 @@ class Trainer:
             )
 
         if self.args.pipeline_parallel_degree > 1 and self.args.use_hybrid_parallel:
-            from paddle.distributed.fleet.meta_parallel import PipelineLayer
-
             assert (isinstance(model, LoRAModel) and isinstance(model.model, PipelineLayer)) or isinstance(
                 model, PipelineLayer
             ), "Only support pipeline parallel mode when model is PipelineLayer!!!"
@@ -700,24 +703,35 @@ class Trainer:
         """
         assert isinstance(self.model, PretrainedModel), "model should be a PretrainedModel when using flash"
         logger.info("Create flash checkpoint manager...")
-        pipeline_hooks_capacity = (
-            unwrapped_model.forward_pipeline_parallel_hook_capacity
-            + unwrapped_model.backward_pipeline_parallel_hook_capacity
-        )
-        self.flash_checkpoint_manager = FlashCheckpointManager(
-            worker_num=self.args.flash_workers_num,
-            pipeline_hooks_capacity=pipeline_hooks_capacity,
-            capacity_usage=self.args.flash_pipeline_hooks_capacity_usage,
-            ema_coef=self.args.flash_save_ema_coef,
-        )
-        for i in range(unwrapped_model.forward_pipeline_parallel_hook_capacity):
-            unwrapped_model.register_forward_pipeline_parallel_hook(
-                location=i, hook=self.flash_checkpoint_manager.flash_checkpoint_pipeline_hook
+        if isinstance(unwrapped_model, PipelineLayer):
+            pipeline_hooks_capacity = (
+                unwrapped_model.forward_pipeline_parallel_hook_capacity
+                + unwrapped_model.backward_pipeline_parallel_hook_capacity
             )
-        for i in range(unwrapped_model.backward_pipeline_parallel_hook_capacity):
-            unwrapped_model.register_backward_pipeline_parallel_hook(
-                location=i, hook=self.flash_checkpoint_manager.flash_checkpoint_pipeline_hook
+            self.flash_checkpoint_manager = FlashCheckpointManager(
+                worker_num=self.args.flash_workers_num,
+                pipeline_hooks_capacity=pipeline_hooks_capacity,
+                capacity_usage=self.args.flash_pipeline_hooks_capacity_usage,
+                ema_coef=self.args.flash_save_ema_coef,
             )
+            for i in range(unwrapped_model.forward_pipeline_parallel_hook_capacity):
+                unwrapped_model.register_forward_pipeline_parallel_hook(
+                    location=i, hook=self.flash_checkpoint_manager.flash_checkpoint_pipeline_hook
+                )
+            for i in range(unwrapped_model.backward_pipeline_parallel_hook_capacity):
+                unwrapped_model.register_backward_pipeline_parallel_hook(
+                    location=i, hook=self.flash_checkpoint_manager.flash_checkpoint_pipeline_hook
+                )
+        else:
+            pipeline_hooks_capacity = self.args.gradient_accumulation_steps
+            self.flash_checkpoint_manager = FlashCheckpointManager(
+                worker_num=self.args.flash_workers_num,
+                pipeline_hooks_capacity=pipeline_hooks_capacity,
+                capacity_usage=self.args.flash_pipeline_hooks_capacity_usage,
+                ema_coef=self.args.flash_save_ema_coef,
+            )
+            _callback = FlashCheckpointCallback(self.flash_checkpoint_manager)
+            self.add_callback(_callback)
         if resume_from_checkpoint is not None:
             path = _add_variant(PADDLE_OPTIMIZER_NAME, self.args.optimizer_name_suffix)
             path = os.path.join(resume_from_checkpoint, path).replace("optimizer", "ema")

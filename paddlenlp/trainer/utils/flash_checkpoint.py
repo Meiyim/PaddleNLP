@@ -33,6 +33,7 @@ from paddle.incubate.tensor.manipulation import (
 )
 from paddle.optimizer.fusion_utils import FusionStorageHelper
 
+from paddlenlp.trainer.trainer_callback import TrainerCallback
 from paddlenlp.transformers.utils import device_guard
 from paddlenlp.utils.env import (
     CONFIG_NAME,
@@ -333,6 +334,14 @@ class ParamFusionStorageHelper:
         tensor.get_tensor()._set_dims(shape)
         tensor.name = name
         return tensor
+
+
+class FlashCheckpointCallback(TrainerCallback):
+    def __init__(self, flash_checkpoint_manager):
+        self.manager = flash_checkpoint_manager
+
+    def on_substep_end(self, args, state, control, **kwargs):
+        self.manager.flash_checkpoint_pipeline_hook(0)
 
 
 class FlashCheckpointManager:
